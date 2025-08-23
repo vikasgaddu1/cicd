@@ -1,0 +1,110 @@
+# SAS Viya Configuration for CI/CD Pipeline
+# Configure your SAS Viya environment settings here
+
+viya:
+  # SAS Viya server configuration
+  server:
+    url: ${SAS_VIYA_URL}  # e.g., https://your-viya-server.com
+    cas_server: ${CAS_SERVER}  # CAS server name
+    cas_port: ${CAS_PORT:-5570}  # CAS port (default 5570)
+  
+  # Authentication
+  auth:
+    method: oauth2  # oauth2 or password
+    client_id: ${SAS_CLIENT_ID}
+    client_secret: ${SAS_CLIENT_SECRET}
+    username: ${SAS_USERNAME}
+    password: ${SAS_PASSWORD}
+  
+  # Compute contexts
+  compute:
+    context: "SASStudioCompute"  # Compute context for job execution
+    options:
+      - "MEMSIZE=4G"
+      - "WORK=/tmp"
+  
+  # CAS libraries
+  cas_libraries:
+    - name: CLINICAL
+      path: /shared/clinical/data
+      description: Clinical trial data library
+    - name: MACROS
+      path: /shared/clinical/macros
+      description: SAS macro library
+    - name: VALIDATION
+      path: /shared/clinical/validation
+      description: Validation datasets
+  
+  # Job execution settings
+  jobs:
+    timeout: 3600  # seconds
+    log_level: INFO
+    error_handling: CONTINUE  # STOP or CONTINUE
+  
+  # File paths in SAS Viya
+  paths:
+    macros: /Public/clinical/macros
+    tests: /Public/clinical/tests
+    reports: /Public/clinical/reports
+    logs: /Public/clinical/logs
+
+# CI/CD Pipeline Settings
+pipeline:
+  # Stages to execute
+  stages:
+    - validate
+    - test
+    - quality
+    - deploy
+    - document
+  
+  # Quality gates
+  quality_gates:
+    code_coverage_threshold: 80
+    test_pass_rate: 100
+    max_warnings: 10
+    max_notes: 50
+  
+  # Deployment settings
+  deployment:
+    target_folders:
+      dev: /Public/clinical/dev
+      test: /Public/clinical/test
+      prod: /Public/clinical/prod
+    
+    # Promotion rules
+    promotion:
+      dev_to_test:
+        approval_required: false
+        auto_promote: true
+      test_to_prod:
+        approval_required: true
+        approvers:
+          - clinical-lead
+          - qa-manager
+
+# Notification settings
+notifications:
+  email:
+    enabled: true
+    recipients:
+      - clinical-programming-team@company.com
+    on_failure: true
+    on_success: false
+  
+  teams:
+    enabled: false
+    webhook_url: ${TEAMS_WEBHOOK_URL}
+    
+# Monitoring and logging
+monitoring:
+  metrics:
+    - execution_time
+    - memory_usage
+    - cpu_usage
+    - dataset_sizes
+  
+  logging:
+    level: INFO
+    format: json
+    destination: /logs/pipeline.log

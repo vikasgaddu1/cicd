@@ -1,0 +1,67 @@
+repos:
+  - repo: local
+    hooks:
+      - id: sas-syntax-check
+        name: SAS Syntax Check
+        entry: python scripts/check_sas_syntax.py
+        language: system
+        files: '\.sas$'
+        pass_filenames: true
+        stages: [commit]
+        
+      - id: no-debug-code
+        name: Check for debug statements
+        entry: '(?i)(put\s+_all_|%put\s+_all_|options\s+mprint|options\s+mlogic|options\s+symbolgen)'
+        language: pygrep
+        files: '\.sas$'
+        exclude: '^tests/'
+        
+      - id: no-hardcoded-paths
+        name: Check for hardcoded paths
+        entry: '(C:\\|\/home\/|\/Users\/|D:\\|E:\\)'
+        language: pygrep
+        files: '\.sas$'
+        exclude: '^(tests|docs)/'
+        
+      - id: check-yaml
+        name: Check YAML syntax
+        entry: python -m yaml
+        language: system
+        files: '\.ya?ml$'
+        
+      - id: check-json
+        name: Check JSON syntax
+        entry: python -m json.tool
+        language: system
+        files: '\.json$'
+        
+      - id: trailing-whitespace
+        name: Fix trailing whitespace
+        entry: sed -i 's/[[:space:]]*$//'
+        language: system
+        files: '\.(sas|py|yaml|yml|json|md)$'
+        
+      - id: end-of-file-fixer
+        name: Fix missing newline at end of file
+        entry: sed -i -e '$a\'
+        language: system
+        files: '\.(sas|py|yaml|yml|json|md)$'
+        
+      - id: check-added-large-files
+        name: Check for large files
+        entry: bash -c 'find . -type f -size +1M -exec echo "Large file detected: {}" \; -exec false \;'
+        language: system
+        pass_filenames: false
+        
+      - id: test-runner-check
+        name: Verify test runner exists
+        entry: bash -c 'test -f sas-clinical-macros/tests/test_runner.sas'
+        language: system
+        pass_filenames: false
+        files: '^sas-clinical-macros/tests/.*\.sas$'
+        
+      - id: macro-documentation
+        name: Check macro documentation
+        entry: python sas-clinical-macros/scripts/check_macro_docs.py
+        language: system
+        files: '^sas-clinical-macros/macros/.*\.sas$'

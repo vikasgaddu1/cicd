@@ -1,0 +1,236 @@
+name: CI - SAS Macros on Viya
+
+on:
+  pull_request:
+    paths: ['sas-clinical-macros/**']
+  push:
+    branches: [ main, develop ]
+    paths: ['sas-clinical-macros/**']
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '20'
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  lint:
+    name: Lint SAS Macros
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          
+      - name: Install SASJS CLI
+        run: npm install -g @sasjs/cli@latest
+        
+      - name: Lint SAS macros
+        run: |
+          cd sas-clinical-macros
+          sasjs lint macros --failOnWarnings=false
+          
+      - name: Upload lint results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lint-results
+          path: sas-clinical-macros/sasjslint.log
+          retention-days: 30
+
+  validate:
+    name: Validate Macros
+    runs-on: ubuntu-latest
+    needs: [lint]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+          
+      - name: Install Python dependencies
+        run: |
+          cd sas-clinical-macros
+          pip install -r requirements.txt
+          
+      - name: Validate YAML headers
+        run: |
+          cd sas-clinical-macros/docs
+          python generate_docs.py --validate-only
+
+  test-viya:
+    name: Test on SAS Viya
+    runs-on: ubuntu-latest
+    needs: [lint, validate]
+    env:
+      VIYA_BASE_URL: ${{ secrets.VIYA_BASE_URL }}
+      VIYA_CLIENT_ID: ${{ secrets.VIYA_CLIENT_ID }}
+      VIYA_CLIENT_SECRET: ${{ secrets.VIYA_CLIENT_SECRET }}
+      VIYA_USER: ${{ secrets.VIYA_USER }}
+      VIYA_PASS: ${{ secrets.VIYA_PASS }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          
+      - name: Install SASJS CLI
+        run: npm install -g @sasjs/cli@latest
+        
+      - name: Create SASJS target configuration
+        run: |
+          cd sas-clinical-macros
+          cat > .sasjsrc << 'EOF'
+          {
+            "targets": [{
+              "name": "viya",
+              "serverType": "viya",
+              "serverUrl": "${VIYA_BASE_URL}",
+              "appLoc": "/Public/ci-sas-macros",
+              "contextName": "Default Compute Context"
+            }],
+            "defaultTarget": "viya"
+          }
+          EOF
+          
+      - name: Authenticate to SAS Viya
+        run: |
+          cd sas-clinical-macros
+          if [ -n "${VIYA_USER}" ] && [ -n "${VIYA_PASS}" ]; then
+            sasjs auth -t viya -u "${VIYA_USER}" -p "${VIYA_PASS}" -c "${VIYA_CLIENT_ID}" -s "${VIYA_CLIENT_SECRET}";
+          else
+            sasjs auth -t viya -c "${VIYA_CLIENT_ID}" -s "${VIYA_CLIENT_SECRET}";
+          fi
+          
+      - name: Ensure output directories
+        run: |
+          mkdir -p sas-clinical-macros/logs
+          mkdir -p sas-clinical-macros/output
+          
+      - name: Run SAS tests on Viya
+        run: |
+          cd sas-clinical-macros
+          sasjs run -t viya \
+            -f tests/test_runner.sas \
+            --logFile logs/ci_viya.log
+            
+      - name: Check for SAS errors or test failures
+        run: |
+          if [ -f sas-clinical-macros/logs/ci_viya.log ]; then
+            if grep -E '^(ERROR:|UNITTEST:\s*FAIL)' sas-clinical-macros/logs/ci_viya.log; then
+              echo "❌ Detected SAS ERROR or UNITTEST FAIL in log"
+              exit 1
+            fi
+            echo "✅ No SAS errors or test failures detected"
+          else
+            echo "❌ Log file not found"
+            exit 1
+          fi
+          
+      - name: Upload test artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: viya-test-results
+          path: |
+            sas-clinical-macros/logs/**
+            sas-clinical-macros/output/**
+          retention-days: 30
+
+  quality-checks:
+    name: Quality Checks
+    runs-on: ubuntu-latest
+    needs: [validate]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Check for hardcoded values
+        run: |
+          cd sas-clinical-macros
+          if grep -r "/users/\|password\|pwd\|C:\\\\" macros/ --include="*.sas"; then
+            echo "❌ ERROR: Hardcoded values found in macros"
+            exit 1
+          fi
+          echo "✅ No hardcoded values found"
+          
+      - name: Verify macro naming conventions
+        run: |
+          cd sas-clinical-macros
+          for file in macros/*.sas; do
+            filename=$(basename "$file" .sas)
+            if ! grep -q "%macro $filename" "$file"; then
+              echo "❌ ERROR: Macro name doesn't match filename in $file"
+              exit 1
+            fi
+          done
+          echo "✅ All macro names match filenames"
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: [validate]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: 'sas-clinical-macros'
+          severity: 'CRITICAL,HIGH'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  documentation:
+    name: Generate Documentation
+    runs-on: ubuntu-latest
+    needs: [quality-checks]
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+          
+      - name: Install Python dependencies
+        run: |
+          cd sas-clinical-macros
+          pip install -r requirements.txt
+          
+      - name: Generate documentation
+        run: |
+          cd sas-clinical-macros/docs
+          python generate_docs.py
+          
+      - name: Upload documentation artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: documentation
+          path: |
+            sas-clinical-macros/docs/index.html
+            sas-clinical-macros/docs/README.md
+            sas-clinical-macros/docs/embeddings.pkl
+          retention-days: 90

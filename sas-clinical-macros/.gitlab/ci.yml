@@ -1,0 +1,364 @@
+# GitLab CI/CD Pipeline for SAS Viya Clinical Macros
+# This pipeline validates, tests, and deploys SAS macros to SAS Viya
+
+variables:
+  SAS_VIYA_URL: ${CI_SAS_VIYA_URL}
+  SAS_USERNAME: ${CI_SAS_USERNAME}
+  SAS_PASSWORD: ${CI_SAS_PASSWORD}
+  SAS_CLIENT_ID: ${CI_SAS_CLIENT_ID}
+  SAS_CLIENT_SECRET: ${CI_SAS_CLIENT_SECRET}
+  CAS_SERVER: ${CI_CAS_SERVER}
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+cache:
+  paths:
+    - .cache/pip
+    - venv/
+
+stages:
+  - validate
+  - test
+  - quality
+  - documentation
+  - deploy
+  - notify
+
+# Templates for common tasks
+.python_setup:
+  before_script:
+    - python -m venv venv
+    - source venv/bin/activate
+    - pip install --upgrade pip
+    - pip install -r requirements.txt
+
+.viya_auth:
+  before_script:
+    - !reference [.python_setup, before_script]
+    - |
+      python -c "
+      import os
+      import sys
+      sys.path.append('viya')
+      from viya_job_executor import SASViyaExecutor
+      executor = SASViyaExecutor()
+      if not executor.authenticate():
+          sys.exit(1)
+      "
+
+# Validation Stage
+validate:syntax:
+  stage: validate
+  extends: .python_setup
+  script:
+    - echo "Validating SAS macro syntax..."
+    - |
+      for file in macros/*.sas; do
+        echo "Checking $file"
+        # Check for basic syntax issues
+        grep -q "%macro" "$file" || exit 1
+        grep -q "%mend" "$file" || exit 1
+      done
+    - echo "Syntax validation completed"
+  artifacts:
+    reports:
+      dotenv: validate.env
+  only:
+    - branches
+    - merge_requests
+
+validate:headers:
+  stage: validate
+  extends: .python_setup
+  script:
+    - echo "Validating YAML headers in macros..."
+    - python docs/generate_docs.py --validate-only
+    - echo "VALIDATION_STATUS=success" >> validate.env
+  artifacts:
+    paths:
+      - docs/validation_report.json
+    expire_in: 1 week
+  only:
+    - branches
+    - merge_requests
+
+validate:viya:
+  stage: validate
+  extends: .viya_auth
+  script:
+    - echo "Validating macros on SAS Viya..."
+    - python viya/viya_job_executor.py --validate-only
+  artifacts:
+    paths:
+      - logs/validation_*.log
+    expire_in: 1 week
+  only:
+    - branches
+    - merge_requests
+
+# Test Stage
+test:unit:
+  stage: test
+  extends: .viya_auth
+  needs: ["validate:syntax", "validate:headers", "validate:viya"]
+  script:
+    - echo "Running unit tests on SAS Viya..."
+    - python viya/viya_job_executor.py --run-tests
+    - |
+      # Check test results
+      python -c "
+      import json
+      import sys
+      with open('logs/pipeline_report.json') as f:
+          report = json.load(f)
+      if report['pipeline_status'] != 'SUCCESS':
+          print(f'Tests failed: {report}')
+          sys.exit(1)
+      print(f'All tests passed: {report[\"tests\"][\"tests_run\"]} tests executed')
+      "
+  artifacts:
+    paths:
+      - logs/test_*.html
+      - logs/test_results.csv
+      - logs/pipeline_report.json
+    reports:
+      junit: logs/test_results.xml
+    expire_in: 1 month
+  coverage: '/Code coverage: \d+\.\d+%/'
+  only:
+    - branches
+    - merge_requests
+
+test:integration:
+  stage: test
+  extends: .viya_auth
+  needs: ["test:unit"]
+  script:
+    - echo "Running integration tests..."
+    - python viya/viya_job_executor.py --integration-tests
+  artifacts:
+    paths:
+      - logs/integration_*.log
+    expire_in: 1 week
+  only:
+    - main
+    - develop
+
+# Quality Stage
+quality:code:
+  stage: quality
+  extends: .python_setup
+  needs: ["validate:syntax"]
+  script:
+    - echo "Running code quality checks..."
+    - |
+      # Check for hardcoded values
+      if grep -r "/users/\|password\|pwd\|C:\\\\" macros/ --include="*.sas"; then
+        echo "ERROR: Hardcoded values found"
+        exit 1
+      fi
+    - |
+      # Check naming conventions
+      for file in macros/*.sas; do
+        filename=$(basename "$file" .sas)
+        if ! grep -q "%macro $filename" "$file"; then
+          echo "ERROR: Macro name doesn't match filename in $file"
+          exit 1
+        fi
+      done
+    - echo "Code quality checks passed"
+  only:
+    - branches
+    - merge_requests
+
+quality:security:
+  stage: quality
+  image: aquasec/trivy:latest
+  script:
+    - trivy fs --exit-code 0 --severity HIGH,CRITICAL --no-progress .
+    - trivy fs --exit-code 1 --severity CRITICAL --no-progress .
+  allow_failure: true
+  only:
+    - main
+    - develop
+
+quality:compliance:
+  stage: quality
+  extends: .viya_auth
+  needs: ["test:unit"]
+  script:
+    - echo "Checking CDISC compliance..."
+    - python viya/viya_job_executor.py --compliance-check
+  artifacts:
+    paths:
+      - logs/compliance_report.html
+    expire_in: 1 month
+  only:
+    - main
+    - develop
+
+# Documentation Stage
+docs:generate:
+  stage: documentation
+  extends: .python_setup
+  needs: ["quality:code"]
+  before_script:
+    - !reference [.python_setup, before_script]
+    - pip install pyyaml sentence-transformers faiss-cpu flask
+  script:
+    - echo "Generating documentation..."
+    - cd docs
+    - python generate_docs.py
+    - echo "Starting search API..."
+    - nohup python search_api.py &
+    - sleep 5
+    - curl -f http://localhost:5000/health || exit 1
+  artifacts:
+    paths:
+      - docs/index.html
+      - docs/README.md
+      - docs/embeddings.pkl
+    expire_in: 1 month
+  only:
+    - main
+    - develop
+
+docs:deploy:
+  stage: documentation
+  needs: ["docs:generate"]
+  image: alpine:latest
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - echo "Deploying documentation to GitLab Pages..."
+    - mkdir -p public
+    - cp -r docs/* public/
+  artifacts:
+    paths:
+      - public
+  pages:
+    stage: documentation
+  only:
+    - main
+
+# Deploy Stage
+deploy:dev:
+  stage: deploy
+  extends: .viya_auth
+  needs: ["test:unit", "quality:code"]
+  environment:
+    name: development
+    url: ${SAS_VIYA_URL}/Public/clinical/dev
+  script:
+    - echo "Deploying to SAS Viya Development..."
+    - python viya/viya_job_executor.py --deploy --env dev
+    - python viya/viya_job_executor.py --smoke-test --env dev
+  only:
+    - develop
+  when: on_success
+
+deploy:test:
+  stage: deploy
+  extends: .viya_auth
+  needs: ["test:integration", "quality:compliance"]
+  environment:
+    name: testing
+    url: ${SAS_VIYA_URL}/Public/clinical/test
+  script:
+    - echo "Deploying to SAS Viya Test..."
+    - python viya/viya_job_executor.py --deploy --env test
+    - python viya/viya_job_executor.py --smoke-test --env test
+  only:
+    - main
+  when: on_success
+
+deploy:prod:
+  stage: deploy
+  extends: .viya_auth
+  needs: ["deploy:test"]
+  environment:
+    name: production
+    url: ${SAS_VIYA_URL}/Public/clinical/prod
+  script:
+    - echo "Deploying to SAS Viya Production..."
+    - python viya/viya_job_executor.py --deploy --env prod
+    - python viya/viya_job_executor.py --smoke-test --env prod
+    - |
+      # Tag release
+      git config user.email "ci@gitlab.com"
+      git config user.name "GitLab CI"
+      TAG="v$(date +%Y%m%d)-${CI_PIPELINE_ID}"
+      git tag $TAG
+      git push origin $TAG
+  only:
+    - main
+  when: manual
+  allow_failure: false
+
+# Notification Stage
+notify:email:
+  stage: notify
+  image: alpine:latest
+  needs: ["deploy:prod"]
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - |
+      if [ "$CI_JOB_STATUS" = "failed" ]; then
+        echo "Pipeline failed, sending notification..."
+        # Send email via API or SMTP
+      fi
+  when: on_failure
+  only:
+    - main
+
+notify:teams:
+  stage: notify
+  image: alpine:latest
+  needs: ["deploy:prod"]
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - |
+      STATUS="${CI_JOB_STATUS:-success}"
+      COLOR=$([ "$STATUS" = "success" ] && echo "00FF00" || echo "FF0000")
+      
+      curl -H "Content-Type: application/json" -d "{
+        \"@type\": \"MessageCard\",
+        \"@context\": \"http://schema.org/extensions\",
+        \"themeColor\": \"$COLOR\",
+        \"summary\": \"SAS CI/CD Pipeline $STATUS\",
+        \"sections\": [{
+          \"activityTitle\": \"SAS Macro Pipeline - GitLab\",
+          \"facts\": [
+            {\"name\": \"Project\", \"value\": \"$CI_PROJECT_NAME\"},
+            {\"name\": \"Branch\", \"value\": \"$CI_COMMIT_BRANCH\"},
+            {\"name\": \"Pipeline\", \"value\": \"$CI_PIPELINE_ID\"},
+            {\"name\": \"Status\", \"value\": \"$STATUS\"},
+            {\"name\": \"URL\", \"value\": \"$CI_PIPELINE_URL\"}
+          ]
+        }]
+      }" ${TEAMS_WEBHOOK_URL}
+  when: always
+  only:
+    - main
+
+# Rollback job
+rollback:prod:
+  stage: deploy
+  extends: .viya_auth
+  environment:
+    name: production
+    url: ${SAS_VIYA_URL}/Public/clinical/prod
+  script:
+    - echo "Rolling back production deployment..."
+    - |
+      # Get previous successful deployment tag
+      PREV_TAG=$(git tag -l "v*" | tail -2 | head -1)
+      echo "Rolling back to $PREV_TAG"
+      git checkout $PREV_TAG
+    - python viya/viya_job_executor.py --deploy --env prod
+    - python viya/viya_job_executor.py --smoke-test --env prod
+  only:
+    - main
+  when: manual
+  allow_failure: false
