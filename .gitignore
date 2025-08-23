@@ -1,0 +1,14 @@
+# Claude-specific files
+.claude/
+
+# Temporary/junk files
+nul
+NUL
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
