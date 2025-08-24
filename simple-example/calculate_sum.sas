@@ -22,8 +22,15 @@
     /* Display result */
     data _null_;
         set &output;
-        put "NOTE: Sum of &var = " sum_value;
+        if sum_value < 0 then do;
+            put "ERROR: Sum of &var is negative";
+            call symputx('test_status', 'FAIL');
+        end;
+        else do;
+            put "NOTE: Sum of &var = " sum_value;
+        end;
     run;
     
     %put NOTE: Sum calculated successfully for &var in &data;
+    %put NOTE: Test Status: &test_status;
 %mend calculate_sum;
