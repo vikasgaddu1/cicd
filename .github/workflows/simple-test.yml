@@ -22,7 +22,7 @@ jobs:
     steps:
       # Get the code from repository
       - name: 📥 Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         
       # Show what files we have
       - name: 📂 List files in simple-example
@@ -126,7 +126,7 @@ jobs:
       
       # Upload test results as artifact
       - name: 📤 Upload test results
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: test-results
           path: test-results/
